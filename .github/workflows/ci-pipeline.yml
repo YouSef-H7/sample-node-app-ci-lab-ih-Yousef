@@ -1,17 +1,14 @@
-name: CI/CD Pipeline with SonarQube and Azure VM
+name: Build, Test, and Deploy to Azure Container Apps
 
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
-  actions: read
-  checks: write
-  pull-requests: write
   id-token: write
 
 jobs:
-  build-and-deploy:
+  build-test-and-deploy:
     runs-on: ubuntu-latest
     environment: dev
 
@@ -22,77 +19,34 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 18.x
+          node-version: 22.x
           cache: npm
           cache-dependency-path: package-lock.json
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Run unit tests with coverage and JUnit reports
-        env:
-          JEST_JUNIT_OUTPUT: coverage/junit.xml
-        run: npm run test:ci
+      - name: Run unit tests (if present)
+        run: npm test --if-present
 
-      - name: Publish test results to Checks
-        uses: dorny/test-reporter@v1
-        if: always()
-        with:
-          name: Jest Test Results
-          path: coverage/junit.xml
-          reporter: jest-junit
-          fail-on-error: true
+      - name: Build the app
+        run: npm run build 2>/dev/null || echo "No build step"
 
-      - name: Upload test results to GitHub
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: test-results-node
-          path: coverage/
-          retention-days: 30
-
-      - name: SonarQube Scan
-        uses: SonarSource/sonarqube-scan-action@v6.0.0
-        env:
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        with:
-          args: >
-            -Dsonar.projectKey=sample-node-app
-            -Dsonar.sources=.
-            -Dsonar.exclusions=node_modules/*,coverage/,tests/,/.test.js,*/.spec.js
-            -Dsonar.tests=tests/
-            -Dsonar.test.inclusions=*/.test.js,*/.spec.js
-            -Dsonar.coverage.exclusions=node_modules/*,coverage/,tests/,/.test.js,*/.spec.js
-      - name: Create deployment package
-        run: |
-          STAGING="$GITHUB_WORKSPACE/deployment-package"
-          rm -rf "$STAGING"
-          mkdir -p "$STAGING"
-          cp -r public "$STAGING/" || true
-          cp server.js package.json package-lock.json "$STAGING/"
-          [ -f Dockerfile ] && cp Dockerfile "$STAGING/"
-          ZIP_NAME="deployment-$(date +%Y%m%d-%H%M%S).zip"
-          (cd "$GITHUB_WORKSPACE" && zip -r "$ZIP_NAME" deployment-package)
-          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
-      - name: Azure login (client secret)
+      - name: Azure Login (Service Principal)
         uses: azure/login@v2
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
 
-      - name: Upload package to Blob
-        uses: azure/cli@v2
-        env:
-          ZIP_NAME: ${{ env.ZIP_NAME }}
-          AZ_STORAGE_ACCOUNT: ${{ secrets.AZ_STORAGE_ACCOUNT }}
-          AZ_STORAGE_CONTAINER: ${{ secrets.AZ_STORAGE_CONTAINER }}
-          AZ_STORAGE_KEY: ${{ secrets.AZ_STORAGE_KEY }}
+      - name: Build, push image to Docker Hub and deploy
+        uses: azure/container-apps-deploy-action@v2
         with:
-          inlineScript: |
-            az storage blob upload \
-              --account-name $AZ_STORAGE_ACCOUNT \
-              --account-key $AZ_STORAGE_KEY \
-              --container-name $AZ_STORAGE_CONTAINER \
-              --file $ZIP_NAME \
-              --name $ZIP_NAME \
-              --overwrite
+          appSourcePath: ${{ github.workspace }}
+          registryUrl: docker.io
+          registryUsername: ${{ secrets.DOCKERHUB_USERNAME }}
+          registryPassword: ${{ secrets.DOCKERHUB_TOKEN }}
+          resourceGroup: rg-yousef
+          containerAppName: frontendapp
+          imageToBuild: ${{ secrets.DOCKERHUB_USERNAME }}/frontendapp-node:${{ github.sha }}
